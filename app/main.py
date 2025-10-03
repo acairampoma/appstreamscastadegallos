@@ -41,7 +41,8 @@ async def health_check():
         "status": "healthy",
         "environment": settings.ENVIRONMENT,
         "contabo_ip": settings.CONTABO_IP,
-        "hls_base_url": settings.HLS_BASE_URL
+        "hls_base_url": settings.HLS_BASE_URL,
+        "railway_deployed": True
     }
 
 if __name__ == "__main__":
