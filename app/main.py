@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api import streams
+from app.api import streams, admin
 
 app = FastAPI(
     title="Gallos Streaming Server",
@@ -20,6 +20,7 @@ app.add_middleware(
 
 # Routers
 app.include_router(streams.router)
+app.include_router(admin.router)
 
 @app.get("/")
 async def root():
