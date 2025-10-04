@@ -3,6 +3,10 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.config import settings
 from sqlalchemy import text
+import boto3
+from botocore.exceptions import ClientError
+import os
+from datetime import datetime
 
 router = APIRouter(prefix="/api/streams", tags=["streams"])
 
@@ -202,3 +206,138 @@ async def detener_stream(
         db.rollback()
         print(f"❌ [STOP] Error: {e}")
         raise HTTPException(status_code=500, detail=f"Error deteniendo stream: {str(e)}")
+
+
+@router.post("/upload-recording")
+async def upload_recording(
+    path: str = Form(...),  # nginx-rtmp envía: /var/www/recordings/stream-20250103-194530.mp4
+    name: str = Form(...),  # nginx-rtmp envía: stream_key
+    db: Session = Depends(get_db)
+):
+    """
+    Endpoint llamado por nginx-rtmp cuando termina de grabar un stream
+
+    nginx.conf debe tener:
+    on_record_done http://appstreamscastadegallos-production.up.railway.app/api/streams/upload-recording;
+
+    Flujo:
+    1. Recibe notificación de nginx cuando termina grabación
+    2. Descarga video del VPS Contabo (vía HTTP)
+    3. Sube video a Cloudflare R2
+    4. Actualiza eventos_transmision.video_url con URL pública
+    5. Marca evento como "finalizado"
+    """
+    print(f"📹 [UPLOAD] Iniciando upload de grabación: {path}")
+    print(f"📹 [UPLOAD] Stream_key: {name[:20]}...")
+
+    try:
+        # 1. Generar nombre único para el video
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"streams/{name[:16]}-{timestamp}.mp4"
+
+        # 2. Obtener usuario por stream_key
+        user_query = text("""
+            SELECT id, email FROM users
+            WHERE stream_key = :stream_key
+        """)
+        user = db.execute(user_query, {"stream_key": name}).fetchone()
+
+        if not user:
+            print(f"⚠️ [UPLOAD] Stream_key no encontrado, grabación guardada pero no asociada")
+            return {"status": "warning", "message": "Stream_key no encontrado"}
+
+        user_id, user_email = user
+        print(f"📹 [UPLOAD] Usuario encontrado: {user_email}")
+
+        # 3. OPCIÓN A: Si nginx-rtmp está en el MISMO servidor que Backend
+        # Lee el archivo directamente del filesystem
+        # video_data = open(path, 'rb').read()
+
+        # 3. OPCIÓN B: nginx-rtmp está en Contabo VPS (diferente servidor)
+        # Descarga el video vía HTTP desde Contabo
+        import requests
+
+        # Construir URL pública del archivo grabado
+        # path = /var/www/recordings/stream-20250103-194530.mp4
+        # URL = http://185.188.249.229/recordings/stream-20250103-194530.mp4
+        filename_only = os.path.basename(path)
+        video_url_contabo = f"http://{settings.CONTABO_IP}/recordings/{filename_only}"
+
+        print(f"📹 [UPLOAD] Descargando video desde Contabo: {video_url_contabo}")
+
+        response = requests.get(video_url_contabo, timeout=300)  # 5 min timeout
+
+        if response.status_code != 200:
+            raise Exception(f"Error descargando video de Contabo: HTTP {response.status_code}")
+
+        video_data = response.content
+        video_size_mb = len(video_data) / (1024 * 1024)
+        print(f"📹 [UPLOAD] Video descargado: {video_size_mb:.2f} MB")
+
+        # 4. Subir a Cloudflare R2
+        print(f"☁️ [UPLOAD] Subiendo a R2: {filename}")
+
+        s3_client = boto3.client(
+            's3',
+            endpoint_url=settings.R2_ENDPOINT,
+            aws_access_key_id=settings.R2_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY,
+            region_name='auto'
+        )
+
+        s3_client.put_object(
+            Bucket=settings.R2_BUCKET_NAME,
+            Key=filename,
+            Body=video_data,
+            ContentType='video/mp4'
+        )
+
+        # 5. URL pública del video
+        public_url = f"{settings.R2_PUBLIC_URL}/{filename}"
+        print(f"✅ [UPLOAD] Video subido a R2: {public_url}")
+
+        # 6. Actualizar evento en base de datos
+        # Buscar el evento "en_vivo" más reciente de este usuario
+        update_query = text("""
+            UPDATE eventos_transmision
+            SET
+                estado = 'finalizado',
+                video_url = :video_url,
+                fecha_fin_evento = NOW()
+            WHERE admin_creador_id = :user_id
+            AND estado = 'en_vivo'
+            RETURNING id, titulo
+        """)
+
+        evento = db.execute(update_query, {
+            "video_url": public_url,
+            "user_id": user_id
+        }).fetchone()
+
+        if evento:
+            db.commit()
+            print(f"✅ [UPLOAD] Evento #{evento[0]} '{evento[1]}' marcado como finalizado")
+        else:
+            # No hay evento en_vivo, solo guardamos el video
+            print(f"⚠️ [UPLOAD] No hay evento 'en_vivo' para actualizar, video guardado en R2")
+
+        # 7. Opcional: Eliminar archivo del VPS Contabo
+        # Puedes hacer un DELETE request a Contabo o dejar que se limpie manualmente
+        # requests.delete(f"http://{settings.CONTABO_IP}/recordings/{filename_only}")
+
+        return {
+            "status": "ok",
+            "message": "Video subido exitosamente",
+            "video_url": public_url,
+            "video_size_mb": round(video_size_mb, 2),
+            "evento_id": evento[0] if evento else None,
+            "evento_titulo": evento[1] if evento else None
+        }
+
+    except Exception as e:
+        db.rollback()
+        print(f"❌ [UPLOAD] Error subiendo grabación: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error subiendo grabación: {str(e)}"
+        )
