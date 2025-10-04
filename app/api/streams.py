@@ -296,42 +296,15 @@ async def upload_recording(
         public_url = f"{settings.R2_PUBLIC_URL}/{filename}"
         print(f"✅ [UPLOAD] Video subido a R2: {public_url}")
 
-        # 6. Actualizar evento en base de datos
-        # Buscar el evento "en_vivo" más reciente de este usuario
-        update_query = text("""
-            UPDATE eventos_transmision
-            SET
-                estado = 'finalizado',
-                video_url = :video_url,
-                fecha_fin_evento = NOW()
-            WHERE admin_creador_id = :user_id
-            AND estado = 'en_vivo'
-            RETURNING id, titulo
-        """)
-
-        evento = db.execute(update_query, {
-            "video_url": public_url,
-            "user_id": user_id
-        }).fetchone()
-
-        if evento:
-            db.commit()
-            print(f"✅ [UPLOAD] Evento #{evento[0]} '{evento[1]}' marcado como finalizado")
-        else:
-            # No hay evento en_vivo, solo guardamos el video
-            print(f"⚠️ [UPLOAD] No hay evento 'en_vivo' para actualizar, video guardado en R2")
-
-        # 7. Opcional: Eliminar archivo del VPS Contabo
-        # Puedes hacer un DELETE request a Contabo o dejar que se limpie manualmente
-        # requests.delete(f"http://{settings.CONTABO_IP}/recordings/{filename_only}")
+        # 6. Solo subir a R2, no actualizar BD (por ahora)
+        print(f"✅ [UPLOAD] Video guardado en R2, no se actualiza BD")
 
         return {
             "status": "ok",
-            "message": "Video subido exitosamente",
+            "message": "Video subido exitosamente a R2",
             "video_url": public_url,
             "video_size_mb": round(video_size_mb, 2),
-            "evento_id": evento[0] if evento else None,
-            "evento_titulo": evento[1] if evento else None
+            "user_email": user_email
         }
 
     except Exception as e:
